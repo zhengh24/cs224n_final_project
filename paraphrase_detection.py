@@ -12,6 +12,7 @@ trains and evaluates your ParaphraseGPT model and writes the required submission
 '''
 
 import argparse
+import math
 import random
 import torch
 
@@ -45,17 +46,76 @@ def seed_everything(seed=11711):
   torch.backends.cudnn.deterministic = True
 
 
+class LoRALinear(nn.Module):
+  def __init__(self, base_layer: nn.Linear, r: int, alpha: float, dropout: float = 0.0):
+    super().__init__()
+    if r <= 0:
+      raise ValueError("LoRA rank r must be > 0 when using LoRALinear.")
+    if not isinstance(base_layer, nn.Linear):
+      raise TypeError("LoRALinear expects an nn.Linear as base_layer.")
+
+    self.base = base_layer
+    self.r = r
+    self.scaling = alpha / r
+
+    self.lora_A = nn.Linear(base_layer.in_features, r, bias=False)
+    self.lora_B = nn.Linear(r, base_layer.out_features, bias=False)
+    self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+    # Freeze the base layer parameters; only LoRA parameters will be trained.
+    for p in self.base.parameters():
+      p.requires_grad = False
+
+    self.reset_parameters()
+
+  def reset_parameters(self):
+    # Initialize A with a standard Kaiming init and B to zeros as in the LoRA paper.
+    nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+    nn.init.zeros_(self.lora_B.weight)
+
+  def forward(self, x):
+    base_out = self.base(x)
+    lora_out = self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+    return base_out + lora_out
+
+
+def inject_lora_into_gpt2(gpt_model: GPT2Model, r: int, alpha: float, dropout: float = 0.0):
+  if r is None or r <= 0:
+    return
+
+  # Freeze all GPT-2 backbone parameters.
+  for p in gpt_model.parameters():
+    p.requires_grad = False
+
+  # Attach LoRA adapters to attention projections (query and value) and
+  # the MLP output projection for more capacity.
+  for layer in gpt_model.gpt_layers:
+    sa = layer.self_attention
+    sa.query = LoRALinear(sa.query, r=r, alpha=alpha, dropout=dropout)
+    sa.value = LoRALinear(sa.value, r=r, alpha=alpha, dropout=dropout)
+
+    layer.out_dense = LoRALinear(layer.out_dense, r=r, alpha=alpha, dropout=dropout)
+
+
 class ParaphraseGPT(nn.Module):
   """Your GPT-2 Model designed for paraphrase detection."""
 
   def __init__(self, args):
     super().__init__()
     self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
-    self.paraphrase_detection_head = nn.Linear(args.d, 2)  # Paraphrase detection has two outputs: 1 (yes) or 0 (no).
+    self.paraphrase_detection_head = nn.Linear(args.d, 2) 
 
-    # By default, fine-tune the full model.
-    for param in self.gpt.parameters():
-      param.requires_grad = True
+    # Parameter-efficient finetuning via LoRA adapters when enabled.
+    lora_r = getattr(args, "lora_r", 0)
+    lora_alpha = getattr(args, "lora_alpha", 16.0)
+    lora_dropout = getattr(args, "lora_dropout", 0.0)
+    if lora_r and lora_r > 0:
+      inject_lora_into_gpt2(self.gpt, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+      # Classification head remains trainable by default.
+    else:
+      # Fall back to full-model fine-tuning.
+      for param in self.gpt.parameters():
+        param.requires_grad = True
 
   def forward(self, input_ids, attention_mask):
     """
@@ -205,6 +265,15 @@ def get_args():
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
+
+  # LoRA / PEFT hyperparameters. When lora_r == 0 (default), training reduces to
+  # standard full fine-tuning. For PEFT, set lora_r > 0 (e.g., 4, 8, 16).
+  parser.add_argument("--lora_r", type=int, default=0,
+                      help="LoRA rank; 0 disables LoRA and trains all GPT-2 parameters.")
+  parser.add_argument("--lora_alpha", type=float, default=16.0,
+                      help="LoRA scaling factor (alpha).")
+  parser.add_argument("--lora_dropout", type=float, default=0.0,
+                      help="Dropout to apply inside LoRA adapters.")
 
   args = parser.parse_args()
   return args
