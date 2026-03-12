@@ -87,14 +87,10 @@ def inject_lora_into_gpt2(gpt_model: GPT2Model, r: int, alpha: float, dropout: f
   for p in gpt_model.parameters():
     p.requires_grad = False
 
-  # Attach LoRA adapters to attention projections (query and value) and
-  # the MLP output projection for more capacity.
   for layer in gpt_model.gpt_layers:
     sa = layer.self_attention
     sa.query = LoRALinear(sa.query, r=r, alpha=alpha, dropout=dropout)
     sa.value = LoRALinear(sa.value, r=r, alpha=alpha, dropout=dropout)
-
-    layer.out_dense = LoRALinear(layer.out_dense, r=r, alpha=alpha, dropout=dropout)
 
 
 class ParaphraseGPT(nn.Module):
