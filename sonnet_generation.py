@@ -72,38 +72,29 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
+  def generate(self, encoding, temperature=0.7, top_k=50, max_length=128):
     """
-    Generates an original sonnet using top-p sampling and softmax temperature.
+    Generates an original sonnet using top-k sampling and softmax temperature.
 
-    TODO: this is probably not ideal. You can look at hugging face's model.generate(...) function for inspiration.
-    In particular, generating multiple sequences and choosing the best with beam search is one avenue. Top_k is another;
-    there are many.
+    Top-k sampling restricts choices at each step to the k most probable tokens,
+    which often balances coherence and creativity better than pure sampling from
+    the full distribution.
     """
     token_ids = encoding.to(self.get_device())
     attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
-
 
     for _ in range(max_length):
       # Forward pass to get logits
       logits_sequence = self.forward(token_ids, attention_mask)
       logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
 
-      # Convert logits to probabilities
-      probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
+      # Top-k sampling: restrict to the k most likely tokens, then sample.
+      k = min(top_k, logits_last_token.size(-1))
+      topk_logits, topk_indices = torch.topk(logits_last_token, k=k, dim=-1)
+      topk_probs = torch.nn.functional.softmax(topk_logits, dim=-1)
 
-      # Top-p (nucleus) sampling
-      sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-      cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-      top_p_mask = cumulative_probs <= top_p
-      top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()  # Shift mask right for proper thresholding
-      top_p_mask[..., 0] = True  # Always include the highest probability token
-      filtered_probs = sorted_probs * top_p_mask  # Zero out unlikely tokens
-      filtered_probs /= filtered_probs.sum(dim=-1, keepdim=True)  # Normalize probabilities
-
-      # Sample from filtered distribution
-      sampled_index = torch.multinomial(filtered_probs, 1)
-      sampled_token = sorted_indices.gather(dim=-1, index=sampled_index)
+      sampled_relative_index = torch.multinomial(topk_probs, num_samples=1)
+      sampled_token = topk_indices.gather(dim=-1, index=sampled_relative_index)
 
       # Stop if end-of-sequence token is reached
       if sampled_token.item() == self.tokenizer.eos_token_id:
@@ -151,7 +142,12 @@ def train(args):
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr)
 
-  # Run for the specified number of epochs.
+  # Early stopping bookkeeping (based on training loss).
+  best_loss = float('inf')
+  epochs_no_improve = 0
+  patience = getattr(args, 'patience', 3)
+
+  # Run for the specified number of epochs (with early stopping).
   for epoch in range(args.epochs):
     model.train()
     train_loss = 0
@@ -181,11 +177,20 @@ def train(args):
     model.eval()
     for batch in held_out_sonnet_dataset:
       encoding = model.tokenizer(batch[1], return_tensors='pt', padding=True, truncation=True).to(device)
-      output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
+      output = model.generate(encoding['input_ids'], temperature=args.temperature, top_k=args.top_k)
       print(f'{batch[1]}{output[1]}\n\n')
 
-    # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
     save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+
+    # Early stopping: if training loss has not improved for `patience` epochs, stop training.
+    if train_loss < best_loss - 1e-3:
+      best_loss = train_loss
+      epochs_no_improve = 0
+    else:
+      epochs_no_improve += 1
+      if epochs_no_improve >= patience:
+        print(f"Early stopping at epoch {epoch} due to no improvement in training loss.")
+        break
 
 
 @torch.no_grad()
@@ -205,7 +210,7 @@ def generate_submission_sonnets(args):
   for batch in held_out_sonnet_dataset:
     sonnet_id = batch[0]
     encoding = model.tokenizer(batch[1], return_tensors='pt', padding=False, truncation=True).to(device)
-    output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)[0][0]
+    output = model.generate(encoding['input_ids'], temperature=args.temperature, top_k=args.top_k)[0][0]
     decoded_output = model.tokenizer.decode(output)
     full_sonnet = f'{decoded_output}\n\n'
     generated_sonnets.append((sonnet_id, full_sonnet))
@@ -231,12 +236,15 @@ def get_args():
   parser.add_argument("--use_gpu", action='store_true')
 
   # Generation parameters.
-  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
-  parser.add_argument("--top_p", type=float, help="Cumulative probability distribution for nucleus sampling.",
-                      default=0.9)
+  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.0)
+  parser.add_argument("--top_k", type=int, help="Number of most likely tokens to sample from (top-k sampling).",
+                      default=50)
 
   parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
+  parser.add_argument("--patience", type=int,
+                      help="Epochs with no train loss improvement before early stopping.",
+                      default=3)
   parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
 
